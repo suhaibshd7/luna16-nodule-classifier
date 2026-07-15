@@ -1,145 +1,142 @@
 # LUNA16 Lung Nodule Classifier
 
-Binary classification of candidate lung nodules from CT scans, using a fine-tuned ResNet-18. Class-imbalance handling is chosen by an explicit ablation rather than assumed, results are reported with bootstrap confidence intervals, and Grad-CAM is used to inspect failure modes.
+Binary classification of candidate lung nodules from CT scans, using a fine-tuned ResNet-18. Class-imbalance handling is chosen by a pre-registered, multi-seed ablation rather than assumed; AUC is reported with a bootstrap confidence interval and precision is additionally reported at true clinical prevalence, not only on the evaluation set; and a hand-rolled Grad-CAM is used to inspect failure modes, including a quantified limitation of the method itself.
 
 ---
 
 ## Clinical Context
 
-Lung cancer is the leading cause of cancer death worldwide, largely because most cases are diagnosed too late for surgical resection. Low-dose CT screening detects lung nodules — small rounded opacities in the lung parenchyma — at a stage when they are still treatable. A radiologist reviewing a chest CT must identify and characterise every nodule, a task that is time-consuming and subject to inter-reader variability. Automated nodule detection is one of the most studied applications of medical imaging AI for exactly this reason.
+Lung cancer is the leading cause of cancer death worldwide, largely because most cases are diagnosed too late for surgical resection. Low-dose CT screening detects lung nodules — small rounded opacities in the lung parenchyma — at a stage when they are still treatable. A radiologist reviewing a chest CT must identify and characterize every nodule, a time-consuming task subject to inter-reader variability. Automated nodule detection is one of the most studied applications of medical imaging AI for exactly this reason.
 
 ---
 
 ## The Task
 
-Given a 64×64 CT patch centred on a candidate coordinate, predict whether it contains a lung nodule (1) or not (0). Candidate locations are pre-provided by LUNA16 annotations, so this model performs **candidate classification** — it does not locate candidates from scratch. Full nodule detection (finding candidates in an unannotated scan) is a harder, separate task.
+Given a 64×64 CT patch centered on a candidate coordinate, predict whether it contains a lung nodule (1) or not (0). Candidate locations are pre-provided by LUNA16 annotations, so this model performs **candidate classification** — it does not locate candidates from scratch. Full nodule detection (finding candidates in an unannotated scan) is a harder, separate task.
 
 ---
 
 ## Dataset
 
-LUNA16 (Lung Nodule Analysis 2016) is derived from LIDC-IDRI, with radiologist-consensus annotations across **888 CT volumes** split into 10 patient-disjoint subsets, and **551,065 total candidate locations** provided in `candidates.csv`.
+LUNA16 (Lung Nodule Analysis 2016) is derived from LIDC-IDRI, with radiologist-consensus annotations across 888 CT volumes split into 10 patient-disjoint subsets, and 551,065 candidate locations in `candidates.csv`.
 
 > Setio AAA, Traverso A, de Bel T, et al. Validation, comparison, and combination of algorithms for automatic detection of pulmonary nodules in computed tomography images. *Medical Image Analysis* 42 (2017): 1–13. https://doi.org/10.1016/j.media.2017.06.015
 
 Dataset: https://www.kaggle.com/datasets/avc0706/luna16
 
-This project uses **subsets 0–4** (445 of the 888 CT volumes), filtered down to **275,358 candidate locations**.
+This project uses **subsets 0–4** (445 of 888 volumes), filtered to **275,358 candidate locations**:
+
+| Split | Subsets | Patches | Positives |
+|---|---|---|---|
+| Train | 0–2 | 4,652 | 416 |
+| Validation | 3 | 1,481 | 128 |
+| Test | 4 | 3,048 | 144 |
+
+True dataset-wide prevalence: **0.245% (~408:1 negative:positive)**.
 
 ---
 
 ## Method
 
 - **Preprocessing:** CT volumes loaded with SimpleITK, resampled to 1mm isotropic spacing, world coordinates converted to voxel indices.
-- **Patch extraction:** 64×64 three-channel patches (axial slices *z*−1, *z*, *z*+1), HU windowed to [−1000, 400], scaled to [0, 1].
-- **Model:** ResNet-18, pretrained on ImageNet, final layer replaced with `nn.Linear(512, 1)`.
-- **Class-imbalance handling:** chosen by ablation (see below), not assumed.
-- **Split:** by LUNA16 subset (0–2 train / 3 val / 4 test) — patient-disjoint by design, so no patient appears in more than one split.
-- **Metric:** AUC-ROC, reported with a bootstrap 95% confidence interval (1,000 resamples).
+- **Patch extraction:** 64×64, three-channel patches (axial slices *z*−1, *z*, *z*+1), HU windowed to [−1000, 400], scaled to [0, 1].
+- **Normalization:** a single scalar mean/std (0.3311 / 0.2977) fit on the training patches only, applied after augmentation. Scalar rather than per-channel, since the 3 channels are the same modality (HU) at different z-slices, not 3 different colors the way R/G/B are — reusing ImageNet's per-channel statistics here would apply color-channel corrections to a non-color signal.
+- **Model:** ResNet-18, ImageNet-pretrained, final layer replaced with `nn.Linear(512, 1)`.
+- **Split:** by LUNA16 subset (patient-disjoint by construction — no patient appears in more than one split).
+- **Class-imbalance handling:** decided by ablation (below), not assumed.
+- **Metrics:** AUC-ROC with bootstrap 95% CI (1,000 resamples); precision reported at true prevalence, not only on the evaluation set.
 
 ---
 
-## Scope Decisions and Limitations
+## Class-Imbalance Ablation
 
-These are deliberate trade-offs for a portfolio-scope project, stated explicitly rather than left implicit.
+LUNA16's ~408:1 imbalance can be addressed by **oversampling** (a `WeightedRandomSampler` targeting ~1 positive per 4 negatives per batch) or by **loss reweighting** (`pos_weight` in `BCEWithLogitsLoss`). Stacking both without checking the interaction is a common mistake — the sampler already changes the effective ratio the network trains on, so a `pos_weight` computed from the *original* ratio applied on top risks over-correcting.
 
-**1. Candidate classification, not full detection.** LUNA16 provides pre-annotated candidate coordinates; the model only classifies each one. A full pipeline would also need a candidate-proposal stage. Results here should not be read as performance on the full detection problem.
-
-**2. A single train/val/test split, not the official 10-fold cross-validation.** LUNA16's standard protocol trains on 9 subsets and tests on the 10th, rotating and averaging across all 10, typically reported as FROC/CPM rather than AUC. This project uses a single fixed split on 5 of the 10 subsets instead, as a time/compute trade-off. Consequence, stated plainly: with only ~144 test positives, this gives a noisier AUC estimate than a 10-fold average would, and the result below is **not directly comparable** to papers reporting FROC/CPM over 10-fold CV on the full dataset. The AUC reported here is an internal metric only.
-
-**3. A 2.5D input (3 axial slices), not a full 3D CNN.** Nodules are 3D structures, and a true 3D CNN — as used in most top LUNA16 leaderboard entries — can use volumetric shape to help separate real nodules from vessel/airway cross-sections that look similar in a single slice. This project uses 3 adjacent axial slices as pseudo-RGB channels for a standard 2D ResNet-18 instead, trading volumetric context for the ability to reuse an ImageNet-pretrained 2D backbone directly, with substantially lower training time and memory use. The Grad-CAM false-positive examples below are a direct, visible consequence of this choice.
-
-**4. Negative subsampling.** LUNA16 has a 407:1 negative:positive ratio; extracting every candidate would require ~13GB of patch storage. This project subsamples negatives at 10:1 (train/val) and 20:1 (test). AUC is largely unaffected by this (it's rank-based), but the confusion matrix and specificity figures reflect the subsampled ratio, not the true clinical ratio.
-
-**5. Labels are radiologist consensus.** Unlike datasets with NLP-derived labels, LUNA16 annotations come from multi-reader radiologist consensus through the LIDC-IDRI process — one of the higher-quality public annotation sets in medical imaging.
-
----
-
-## Ablation: Class-Imbalance Strategy
-
-LUNA16's 407:1 imbalance can be addressed two ways: **oversampling** (a `WeightedRandomSampler` that changes what the network actually sees during training, targeting roughly 1 positive per 4 negatives per batch) or **loss reweighting** (`pos_weight` in `BCEWithLogitsLoss`, penalising a missed positive more heavily). These solve the same problem, and stacking both without checking the interaction is a common mistake: the sampler already changes the effective ratio the network trains on to ~4:1, so a loss weight computed from the *original* 10:1 ratio applied on top of that risks over-correcting.
-
-Both configurations were trained under identical initialisation and compared on the validation set before either was used on the held-out test set:
-
-- **Config A** — sampler + pos_weight (both mechanisms stacked)
+- **Config A** — sampler + pos_weight (stacked)
 - **Config B** — sampler only
 
-| Config | Val AUC | 95% CI | Specificity @ 90% sensitivity |
-|---|---|---|---|
-| A (sampler + pos_weight) | 0.9714 | [0.9572, 0.9834] | 91.28% |
-| B (sampler only) | 0.9722 | [0.9574, 0.9857] | 93.20% |
+Both configs were trained across **7 seeds, fixed before looking at any result**. The same seed produces identical initialization and batch order for both configs, making the per-seed (B − A) differences a paired sample rather than independent draws, so the comparison uses a paired t-test rather than a win count.
 
-AUC confidence intervals overlap almost completely — with only ~128 validation positives, AUC alone can't reliably distinguish the two. Specificity at matched sensitivity is the more informative comparison here, since it reflects the false-positive burden a screening workflow would actually see, and **Config B was consistently equal-or-better with no AUC cost**. This is consistent with the sampler already rebalancing the batches the network trains on, making the additional pos_weight correction an over-correction rather than a help.
+| Config | Val AUC (mean ± SD) | Spec @ 90% sens (mean ± SD) |
+|---|---|---|
+| A (sampler + pos_weight) | 0.9774 ± 0.0045 | 0.9472 ± 0.0140 |
+| B (sampler only) | 0.9686 ± 0.0064 | 0.9196 ± 0.0315 |
 
-**Config B (sampler only) was selected** and carried forward to the test evaluation below.
+Paired t-test on spec@90%sens (B vs A): **t = −1.91, p = 0.104** — short of the pre-registered α = 0.05.
+
+**Decision rule (fixed before this run):** a non-significant result defaults to selecting Config B, on parsimony grounds (one fewer hyperparameter to separately justify), rather than treating a non-significant p-value as evidence the configs are equivalent. That rule was followed, and **Config B is the configuration used for the results below.**
+
+That said, the point estimate is stated plainly rather than only the decision: **Config A had the higher validation AUC in 6 of 7 seeds**, and its spec@90%sens was both higher on average and less than half as variable across seeds (SD 0.0140 vs 0.0315). A non-significant result at n=7 is a statement about the power of this comparison, not proof of equivalence — the direction consistently favored A, and whether that would firm up with more seeds is untested. Both facts are reported because a parsimony-based pick should not be misread as the ablation endorsing Config B.
 
 ---
 
 ## Results
 
-Evaluated once on the held-out, patient-disjoint test set (subset 4), using the operating threshold selected on the *validation* set above and applied fixed to test — the threshold was never tuned on the data it's reported on.
+Evaluated once on the held-out, patient-disjoint test set (subset 4), using the Config B checkpoint (seed 2, validation AUC 0.9788) and the operating threshold selected on validation — applied fixed to test, never re-tuned.
 
 | Metric | Value |
 |---|---|
-| **Test AUC-ROC** | 0.9547 |
-| **95% CI (bootstrap, n=1000)** | [0.9303, 0.9758] |
-| **Applied threshold** (from validation) | 0.0571 |
-| **Sensitivity** | 88.89% |
-| **Specificity** | 93.11% |
-| **Precision** | 39.02% |
-| TN / FP | 2704 / 200 |
-| FN / TP | 16 / 128 |
+| **Precision at true LUNA16-wide prevalence (~408:1)** | **5.02%** |
+| Precision on the 20:1 subsampled test set actually evaluated | 51.63% |
+| Test AUC-ROC | 0.9772 (95% CI [0.9621, 0.9893], bootstrap *n*=1000) |
+| Sensitivity | 88.19% |
+| Specificity | 95.90% |
+| Operating threshold (from validation) | 0.0778 |
+| TN / FP / FN / TP (on 20:1 test set) | 2785 / 119 / 17 / 127 |
 
-The threshold was selected on validation to target ~90% sensitivity — the standard clinical framing for screening, where a missed nodule (false negative) is costlier than an unnecessary follow-up (false positive). Sensitivity on test came out at 88.89%, slightly below the 90% validation target; this is expected, since the threshold was fixed in advance rather than re-tuned to hit exactly 90% on test data. Precision is low (39%) by design — the threshold prioritises catching nodules over avoiding false alarms, appropriate for a screening context but worth stating plainly rather than leaving implicit.
-
----
-
-## Reproducibility
-
-Global random seeds are set for numpy, Python's `random`, and PyTorch (including CUDA). Despite this, **running the full pipeline twice produced slightly different results**, because `torch.manual_seed` does not guarantee bitwise-identical GPU training — early stopping landed on a different epoch each run. This is worth stating directly rather than treating the reported numbers as exact:
-
-| Run | Config A spec@90%sens | Config B spec@90%sens | Gap | Test AUC |
-|---|---|---|---|---|
-| Run 1 | 86.77% | 94.31% | 7.5 pts | 0.9633 |
-| Run 2 (reported above) | 91.28% | 93.20% | 1.9 pts | 0.9547 |
-
-The **direction** of the finding is stable across both runs — Config B is equal-or-better on both AUC and specificity every time — but the **magnitude** of the gap is not, and should not be quoted as a fixed number. Both runs' test AUC values fall within each other's bootstrap CI, so the two runs are consistent with a single underlying performance level rather than a real change in the model. This distinction — between resampling variance (captured by the bootstrap CI) and training-run variance (only visible by actually repeating the run) — is not something a single execution can show on its own.
+The threshold targets ~90% sensitivity — the standard framing for screening, where a missed nodule is costlier than an unnecessary follow-up. The two precision figures answer different questions: 51.63% describes this exact classifier on the 20:1 subsampled set actually evaluated; **5.02% describes the same classifier's sensitivity/specificity applied at the true ~1-in-408 candidate prevalence** — roughly 95 of every 100 flagged candidates would be false alarms. This is not specific to this model; it is the expected shape of candidate-classification-stage precision before further pipeline stages (additional classifiers, radiologist review) filter further, which is why production detection systems are built as cascades rather than a single classifier.
 
 ---
 
 ## Grad-CAM Interpretability
 
-Grad-CAM heatmaps are generated for one example per outcome category (TP/TN/FP/FN), using the terminal convolutional block (`model.layer4[-1]`) as the target layer. Each row shows the original patch, the raw heatmap, and the heatmap overlaid on the patch with the predicted probability.
+Grad-CAM is implemented directly rather than via a library, so the raw pre-ReLU values are inspectable — a library's internal min-max normalization can silently turn a genuinely all-zero attribution map into a rescaled, ordinary-looking one, making it impossible to tell "no evidence" from "display artifact" without reaching into the internals.
 
-- **True Positive (p=1.00):** a distinct nodule is visible in the patch, and activation is strongly localized — though in the bottom-left quadrant, adjacent to rather than precisely centred on the lesion itself.
-- **True Negative (p=0.00):** normal vascular anatomy, no nodule present, and the heatmap shows no activation anywhere in the patch — a confident, correctly localized negative.
-- **False Positive (p=0.13):** true label is 0, but the patch contains a bright, dense structure consistent with a rib or vertebral bone fragment. At 0.13, this sits just above the 0.0571 operating threshold and is misclassified as positive. The heatmap shows no localized activation at all — the above-threshold probability does not correspond to the model attending to the bony structure specifically, but to a diffuse, low-magnitude signal spread across the patch.
-- **False Negative (p=0.02):** a clearly visible round nodule in the lung parenchyma is missed entirely. The heatmap shows no activation on the nodule, or anywhere else in the patch.
+For a single-logit binary head, standard Grad-CAM's final ReLU means one call can only surface evidence *for* whatever scalar is backpropagated. Asking "why did the model reject this" requires backpropagating from the *negated* logit, not the one used for "why did the model accept this" — both directions are computed here.
 
-**Two things worth noting about this analysis, not just the observations themselves:**
+Before drawing any conclusion from a single image, the flat-map rate was checked numerically across up to 20 examples per outcome:
 
-- **Grad-CAM's spatial resolution is limited by patch size here.** Patches are 64×64, and ResNet-18 downsamples by 32× before its final convolutional block, so the feature map Grad-CAM is computed from is only ~2×2 pixels before upsampling. In practice, this means Grad-CAM can only localize to coarse quadrants, not precise boundaries — consistent with the TP heatmap landing adjacent to, rather than exactly on, the lesion. This is a property of the architecture and patch size, not a training failure.
-- **This is an illustration from a single example per category, not a characterized failure mode.** Only one example per outcome is shown (see Scope Decisions), so the apparent pattern — that both error cases show diffuse, near-blank activation rather than confident-but-wrong localization onto a specific structure — is suggestive, not established. It would be a genuinely interesting finding if it held generally (the model's errors being driven by diffuse uncertainty rather than mistaking one anatomical structure for another), but confirming that would require running Grad-CAM across many FP/FN examples, which this project does not do.
+| Outcome | Flat-map rate (sign = evidence-for-nodule) |
+|---|---|
+| True Positive | 3/20 (15%) |
+| True Negative | 20/20 (100%) |
+| False Positive | 9/20 (45%) |
+| False Negative | 17/17 (100%, all available) |
+
+**True Negatives and False Negatives are flat 100% of the time** — this is a correct, mathematically expected result, not a failure of the method: a confidently-negative prediction means no spatial location increased the "nodule" logit, so there is nothing for a positive-evidence-only map to point to. Backpropagating from the negated logit on the same two illustrative examples confirms the network isn't simply ignoring the input — both show strong, non-degenerate "evidence against nodule" (pre-ReLU max of 2.33 and 1.65 respectively), meaning the rejection is driven by identifiable features that argue *against* a nodule, not an absence of signal.
+
+**False Positives are flat 45% of the time, and even True Positives are flat 15% of the time** — this is the more consequential finding. Crossing the decision threshold only requires the *sum* of contributions across all 512 channels to be net positive; GAP-based Grad-CAM only visualizes locations whose *individual* contribution survives a ReLU. A prediction driven by many small, spatially-distributed contributions can cross the threshold while leaving no single location for Grad-CAM to highlight. This is a real, quantified limitation of the method on this model, not an implementation bug: a blank Grad-CAM map on a borderline call should be read as "no spatially-concentrated evidence," not "no evidence."
+
+*(Figures are rendered inline in the notebook — see Sections 13–14.)*
+
+---
+
+## Reproducibility
+
+Seeds are fixed for `numpy`, Python's `random`, and PyTorch (including CUDA), and `cudnn.deterministic` is enabled. This exact 7-seed ablation was executed twice — across an intervening code change that touched only the results-reporting logic, not the training loop — and both runs produced identical per-epoch training losses, validation AUCs, early-stopping epochs, and Grad-CAM diagnostic outputs to the reported precision. This is a stronger signal than a single run, though it's specific to this environment (Kaggle GPU) and PyTorch/cuDNN version; determinism settings do not guarantee bitwise reproducibility across different hardware or library versions.
+
+---
+
+## Scope Decisions and Limitations
+
+Deliberate trade-offs for a portfolio-scope project, stated explicitly rather than left implicit:
+
+1. **Candidate classification, not full detection.** Candidate coordinates are pre-provided by LUNA16; this model only classifies each one. A full pipeline would also need a candidate-proposal stage.
+2. **A single train/val/test split on 5 of 10 subsets, not the official 10-fold cross-validation.** LUNA16's standard protocol trains on 9 subsets and tests on the 10th, rotating and averaging, typically reported as FROC/CPM rather than AUC. With ~144–147 test/val positives this is a noisier estimate than a 10-fold average, and not directly comparable to leaderboard figures.
+3. **A 2.5D input (3 axial slices), not a full 3D CNN.** This trades the volumetric shape information a true 3D CNN could use to separate nodules from similar-looking vessel/airway cross-sections, for the ability to reuse a 2D ImageNet-pretrained backbone directly.
+4. **Negative subsampling.** The true candidate ratio is ~408:1; this project subsamples to 10:1 (train/val) and 20:1 (test) for storage/compute reasons. AUC is largely unaffected (it's rank-based), but precision and the confusion matrix reflect the subsampled ratio unless explicitly corrected for prevalence (see Results).
+5. **The class-imbalance ablation did not reach statistical significance at 7 seeds** (paired t-test p=0.104), despite Config A trending consistently better on both metrics. Config B was selected per a rule fixed before the run, not because the ablation demonstrated it superior — see the Ablation section for the full disclosure.
+6. **GAP-based Grad-CAM has a quantified blind spot** on borderline predictions (flat on 45% of False Positives, 15% of True Positives) — see Interpretability.
+7. **Labels are radiologist consensus** via the LIDC-IDRI multi-reader process — one of the higher-quality public annotation sets in medical imaging.
 
 ---
 
 ## Requirements
 
-Python 3.10
-
-```text
-torch==2.0.0
-torchvision==0.15.0
-SimpleITK==2.2.1
-numpy==1.24.0
-pandas==2.0.0
-scikit-learn==1.2.0
-matplotlib==3.7.0
-grad-cam==1.4.8
-```
+Run in a Kaggle notebook with GPU enabled. Dependencies: `torch`, `torchvision`, `SimpleITK`, `numpy`, `pandas`, `scipy`, `scikit-learn`, `matplotlib` — all present in the standard Kaggle Python GPU environment.
 
 ## How to Run
 
-1. Add the [LUNA16 dataset](https://www.kaggle.com/datasets/avc0706/luna16) to your Kaggle notebook.
-2. Set `MINI_RUN = True` in the Configuration section for a ~2-minute pipeline test, or `False` for the full run.
-3. Run all cells top to bottom. Section 9 trains both ablation configurations; Section 10 reads the comparison table and selects one for the final test evaluation in Section 11.
+1. Add the [LUNA16 dataset](https://www.kaggle.com/datasets/avc0706/luna16) to a Kaggle notebook with GPU enabled.
+2. Set `MINI_RUN = True` for a ~2-minute pipeline smoke-test, or `False` for the full run (patch extraction + 7-seed ablation, 14 training runs, plus Grad-CAM diagnostics).
+3. Run all cells top to bottom. Section 9 trains both ablation configs across all seeds; Section 10 compares them and selects the final checkpoint; Section 11 evaluates once, on the held-out test set; Sections 12–14 run and diagnose Grad-CAM.
